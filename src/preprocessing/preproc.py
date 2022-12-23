@@ -1,0 +1,336 @@
+import pathlib
+import sys
+from typing import List
+import pandas as pd
+import re
+import nltk
+nltk.download('punkt')
+from nltk.tokenize import word_tokenize
+import pandas as pd
+import contractions
+import spacy
+import argparse
+from langdetect import detect
+from tqdm import tqdm
+from gensim.models.phrases import Phrases, ENGLISH_CONNECTOR_WORDS
+from acronyms import acronyms_list
+from preproc_utils import det
+import dask.dataframe as dd
+from dask.diagnostics import ProgressBar
+import logging
+from preproc_utils import check_nltk_packages
+
+#!python -m spacy download en_core_web_lg
+#!python -m spacy download xx_sent_ud_sm
+#!pip install --upgrade spacy_langdetect
+
+class nlpPipeline():
+    """
+    Class to carry out text preprocessing tasks that are needed by topic modeling
+    - Basic stopword removal
+    - Acronyms substitution
+    - NLP preprocessing
+    - Ngrams detection
+    """
+    
+    def __init__(self, 
+                 stw_files: List[pathlib.Path], 
+                 corpus_df: dd.DataFrame, 
+                 logger=None):
+        """
+        Initilization Method
+        Stopwords files will be loaded during initialization
+
+        Parameters
+        ----------
+        stw_files: list of str
+            List of paths to stopwords files
+        corpus_df: dd.DataFrame
+            Dataframe representation of the corpus to be preprocessed. 
+            It needs to contain (at least) the following columns:
+            - raw_text
+        logger: Logger object
+            To log object activity
+        """
+       
+        if logger:
+            self._logger = logger
+        else:
+            logging.basicConfig(level='INFO')
+            self._logger = logging.getLogger('nlpPipeline')
+        
+        self._stopwords = self._loadSTW(stw_files)
+        
+        if "raw_text" not in corpus_df.columns:
+            self._logger.error(
+                f'-- -- Field raw_text not present in corpus df -- Stop')
+            sys.exit()
+        else:
+            self._corpus_df = corpus_df
+            
+        return
+            
+    def _loadSTW(self, stw_files: List[pathlib.Path]):
+        """
+        Loads all stopwords as list from all files provided in the argument
+
+        Parameters
+        ----------
+        stw_files: list of str
+            List of paths to stopwords files
+        """
+        
+        stw_list = []
+        for stw_file in stw_files:
+            stw_df = pd.read_csv(stw_file, names=['stopwords'], header=None, skiprows=3)
+            stw_list.extend(list(stw_df['stopwords']))
+        self._stw_list = list(dict.fromkeys(stw_list)) # remove duplicates
+        self._logger.info(f"Stopwords list created with {len(stw_list)} items.")
+
+        return 
+    
+    def _loadACR(self):
+        """
+        Loads list of acronyms
+        """
+        
+        self._acr_list = acronyms_list
+        
+        return
+    
+    def _replace(self, text, patterns) -> str:
+        """
+        Auxiliary function to replace patterns in strings.
+        
+        Parameters
+        ----------
+        text: str
+            Text in which the patterns are going to be replaced
+        patterns: List of tuples
+            Replacement to be carried out
+            
+        Returns
+        -------
+        text: str
+            Replaced text
+        """
+         
+        for(raw,rep) in patterns:
+            regex = re.compile(raw)
+            text = regex.sub(rep,text)
+        return text
+
+    def do_pipeline(self, nlp, rawtext) -> str:
+        """
+        Carries out NLP pipeline. In particular, the following steps:
+        - Lemmatization according to POS
+        - Removal of non-alphanumerical tokens
+        - Removal of basic English stopwords and additional ones provided       
+          within stw_files
+        - Acronyms replacement
+        - Expansion of English contractions
+        - Word tokenization
+        - Lowercase conversion
+        
+        Parameters
+        ----------
+        nlp: spacy.lang.en.English
+            Spacy pipeline
+        rawtext: str
+            Text to preprocess
+            
+        Returns
+        -------
+        final_tokenized: List[str]
+            List of tokens (strings) with the preprocessed text
+        """
+        
+        valid_POS = set(['VERB', 'NOUN', 'ADJ', 'PROPN'])
+
+        doc = nlp(rawtext)
+        lemmatized = ' '.join([token.lemma_ for token in doc
+                            if token.is_alpha
+                            and token.pos_ in valid_POS
+                            and not token.is_stop
+                            and token.lemma_ not in self._stw_list])
+        
+        lemmatized2 = ''
+        for lemma in lemmatized.split(' '):
+            # Change acronyms by their meaning
+            text = self._replace(lemma,self._acr_list) 
+            # Expand contractions 
+            text2 = contractions.fix(text) 
+            lemmatized2 = lemmatized2 + ' ' + text2
+        # To build the dictionary afterwards
+        tokenized2 = word_tokenize(lemmatized2) 
+        # Convert to lowercase
+        final_tokenized = [token.lower() for token in tokenized2] 
+        return final_tokenized
+
+
+    def preproc(self, corpus_df: dd.DataFrame) -> dd.DataFrame:
+        """
+        Invokes NLP pipeline and carries out, in addition, n-gram detection.
+        
+        Parameters
+        ----------
+        corpus_df: dd.DataFrame
+            Dataframe representation of the corpus to be preprocessed. 
+            It needs to contain (at least) the following columns:
+            - raw_text
+            
+        Returns
+        -------
+        corpus_df: dd.DataFrame
+            Preprocessed DataFrame
+            It needs to contain (at least) the following columns:
+            - raw_text
+            - lemmas
+            - lemmas_with_grams
+        """
+        
+        # Create nlp pipeline
+        nlp = spacy.load('en_core_web_lg')
+
+        # Disable unnecessary components
+        nlp.disable_pipe('parser')
+        nlp.disable_pipe('ner')
+        
+        # Create corpus from tokenized lemmas
+        corpus = corpus_df['lemmas'].values
+        
+        # Create Phrase model for n-grams detection
+        phrase_model = Phrases(corpus, min_count=2, threshold=20, connector_words=ENGLISH_CONNECTOR_WORDS)
+        
+        # Carry out n-grams substitution
+        corpus = [el for el in phrase_model[corpus]] 
+
+        # Save n-grams in new column in the dataFrame
+        corpus_df["lemmas_with_grams"] = corpus
+        
+        return corpus_df
+            
+    
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(
+        description="Scripts for Embeddings Service")
+    parser.add_argument("--source_path", type=str, default=None,
+                        required=True, metavar=("path_to_parquet"),
+                        help="Path to file with source file/s")
+    parser.add_argument("--source_type", type=str, default=None,
+                        required=True, metavar=("source_type"),
+                        help="Type of file in which the source is contained")
+    parser.add_argument("--source", type=str, default=None,
+                        required=True, metavar=("source_type"),
+                        help="Name of the dataset to be preprocessed (e.g., cordis)")
+    parser.add_argument("--destination_path", type=str, default=None,
+                        required=True, metavar=("destination_path"),
+                        help="Path to save the new preprocessed files")
+    parser.add_argument("--nw", type=int, default=0,
+                    required=False, help="Number of workers to use with Dask")
+    
+    # Create logger object
+    logging.basicConfig(level='INFO')
+    logger = logging.getLogger('nlpPipeline')
+    
+    logger.info(
+                f'-- -- Installing necessary packages...')
+    check_nltk_packages()
+    
+    args = parser.parse_args()
+    
+    source_path = pathlib.Path(args.source_path)
+    destination_path = pathlib.Path(args.destination_path)
+    
+    # Create corpus_df
+    if args.source_type == "xlsx":
+        if args.source == "cordis":
+            logger.info(
+                f'-- -- Reading from Cordis...')
+            raw_text_fld = "summary"
+            title_fld = "title"
+            
+        df = pd.read_excel(source_path)
+        corpus_df = dd.from_pandas(df, npartitions=3)
+        
+        corpus_df = corpus_df.sample(frac=0.1, replace=True, random_state=1)
+        corpus_df = corpus_df[["title", "summary"]]
+        
+        # Detect abstracts' language and filter out those non-English ones
+        corpus_df['langue'] = corpus_df[raw_text_fld].apply(det, meta=('langue', 'object'))
+        corpus_df = corpus_df[corpus_df['langue'] == 'en']
+        
+        # Filter out abstracts with no text   
+        corpus_df = corpus_df[corpus_df[raw_text_fld] != ""]
+        
+        # Concatenate title + abstract/summary
+        corpus_df["raw_text"] = corpus_df[[title_fld, raw_text_fld]].apply(" ".join, axis=1, meta=('raw_text', 'object'))
+        
+    elif args.source_type == "parquet":
+        if args.source == "scholar":
+            logger.info(
+                f'-- -- Reading from Scholar...')
+            raw_text_fld = "paperAbstract"
+            title_fld = "title"
+            
+        res = []
+        for entry in source_path.iterdir():
+            # check if it is a file
+            if entry.as_posix().endswith("parquet"):
+                res.append(entry)
+        
+        logger.info(
+                f'-- -- Reading of parquet files starts...')
+        for idx, f in enumerate(tqdm(res)):
+            df = dd.read_parquet(f)
+            
+            # Filter out abstracts with no text   
+            df = df[df[raw_text_fld] != ""]
+            
+            # Detect abstracts' language and filter out those non-English ones
+            df['langue'] = df[raw_text_fld].apply(det, meta=('langue', 'object'))
+            df = df[df['langue'] == 'en']
+            
+            # Filter out abstracts with no text   
+            df = df[df[raw_text_fld] != ""]
+            
+            # Concatenate title + abstract/summary
+            df["raw_text"] = df[[title_fld, raw_text_fld]].apply(" ".join, axis=1, meta=('raw_text', 'object'))
+            
+            # Concatenate dataframes
+            if idx == 0:
+                corpus_df = df
+            else:
+                corpus_df = dd.concat([corpus_df, df])
+    
+    # Get stopword lists
+    stw_lsts = []
+    for entry in pathlib.Path("/workspaces/hierarchical-topic-models/data/stw_lists").iterdir():
+        # check if it is a file
+        if entry.as_posix().endswith("parquet"):
+            stw_lsts.append(entry)
+    
+    logger.info(
+                f'-- -- NLP preprocessing starts...')
+    nlpPipeline = nlpPipeline(stw_files=stw_lsts, 
+                              corpus_df=corpus_df,
+                              logger=logger )
+
+            
+    # Save new df in parquet file
+    outFile = destination_path.joinpath("preproc_" + args.source + ".parquet")
+    if outFile.is_file():
+        outFile.unlink()
+
+    with ProgressBar():
+        if args.nw > 0:
+            corpus_df.to_parquet(outFile, write_index=False, compute_kwargs={
+                'scheduler': 'processes', 'num_workers': args.nw})
+        else:
+            # Use Dask default number of workers (i.e., number of cores)
+            corpus_df.to_parquet(outFile, write_index=False, compute_kwargs={
+                'scheduler': 'processes'})
+
+
+    
